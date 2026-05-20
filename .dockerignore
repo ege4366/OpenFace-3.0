@@ -1,0 +1,6 @@
+.git
+Dockerfile
+__pycache__
+*.pyc
+.ipynb_checkpoints
+feature_maps_output

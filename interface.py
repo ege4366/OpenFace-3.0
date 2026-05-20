@@ -6,27 +6,11 @@ import torch.nn as nn
 import timm
 import numpy as np
 from PIL import Image
-import dlib
-import os
 import argparse
 
-import torch.nn.functional as F
-import torch.optim as optim
 import cv2
 
 from model.MLT import MLT
-
-from model.AutomaticWeightedLoss import AutomaticWeightedLoss
-from Pytorch_Retinaface.models.retinaface import RetinaFace
-from Pytorch_Retinaface.layers.functions.prior_box import PriorBox
-from Pytorch_Retinaface.utils.box_utils import decode, decode_landm
-from Pytorch_Retinaface.utils.nms.py_cpu_nms import py_cpu_nms
-from Pytorch_Retinaface.data import cfg_mnet, cfg_re50
-from Pytorch_Retinaface.detect import load_model
-
-from STAR.demo import GetCropMatrix, TransformPerspective, TransformPoints2D, Alignment, draw_pts
-
-import matplotlib.pyplot as plt
 
 transform = transforms.Compose([
     transforms.Resize((224, 224)), 
@@ -85,7 +69,7 @@ class ActionUnitAnalyzer:
             aus_presence (dict): AU presence values.
             aus_intensity (dict): AU intensity values.
         """
-        pil_image = Image.open(image_path)
+        pil_image = Image.open(image_path).convert("RGB")
         image = transform(pil_image)
         image = image.unsqueeze(0).to(self.device)
 
@@ -112,7 +96,7 @@ class EmotionRecognizer:
         Returns:
             emotion_output (torch.Tensor): Predicted emotion values.
         """
-        pil_image = Image.open(image_path)
+        pil_image = Image.open(image_path).convert("RGB")
         image = transform(pil_image)
         image = image.unsqueeze(0).to(self.device)
 
@@ -139,7 +123,7 @@ class GazeEstimator:
         Returns:
             gaze_output (torch.Tensor): Estimated gaze direction.
         """
-        pil_image = Image.open(image_path)
+        pil_image = Image.open(image_path).convert("RGB")
         image = transform(pil_image)
         image = image.unsqueeze(0).to(self.device)
 
@@ -151,23 +135,34 @@ class GazeEstimator:
 
 
 if __name__ == '__main__':
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    parser = argparse.ArgumentParser(description="Run OpenFace-3.0 multitask inference.")
+    parser.add_argument("--image", default="images/89.jpg", help="Input image path.")
+    parser.add_argument("--mtl-model", default="./weights/stage2_epoch_7_loss_1.1606_acc_0.5589.pth", help="Multitask model weight path.")
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Inference device.")
+    args = parser.parse_args()
+
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
 
     # Load models separately
-    model_path = "./weights/stage2_epoch_7_loss_1.1606_acc_0.5589.pth"
     model = MLT()  
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.load_state_dict(torch.load(args.mtl_model, map_location=device))
     model = model.to(device)
+    model.eval()
 
     # Initialize specific components
     au_analyzer = ActionUnitAnalyzer(model, device)
     emotion_recognizer = EmotionRecognizer(model, device)
+    gaze_estimator = GazeEstimator(model, device)
     
     # Run specific tasks
-    image_path = "images/89.jpg"
-    aus = au_analyzer.predict_aus(image_path)
+    aus = au_analyzer.predict_aus(args.image)
     print("AU Output:", aus)
 
-    emotion = emotion_recognizer.predict_emotion(image_path)
+    emotion = emotion_recognizer.predict_emotion(args.image)
     print("Emotion Output:", emotion)
 
+    gaze = gaze_estimator.estimate_gaze(args.image)
+    print("Gaze Output:", gaze)

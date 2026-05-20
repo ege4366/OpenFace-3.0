@@ -6,7 +6,6 @@ import torch.nn as nn
 import timm
 import numpy as np
 from PIL import Image
-import dlib
 import os
 import argparse
 
@@ -22,11 +21,21 @@ from Pytorch_Retinaface.layers.functions.prior_box import PriorBox
 from Pytorch_Retinaface.utils.box_utils import decode, decode_landm
 from Pytorch_Retinaface.utils.nms.py_cpu_nms import py_cpu_nms
 from Pytorch_Retinaface.data import cfg_mnet, cfg_re50
-from Pytorch_Retinaface.detect import load_model
 
 from STAR.demo import GetCropMatrix, TransformPerspective, TransformPoints2D, Alignment, draw_pts
 
-import matplotlib.pyplot as plt
+
+def load_retinaface_model(model, pretrained_path, device):
+    print(f"Loading pretrained model from {pretrained_path}")
+    pretrained_dict = torch.load(pretrained_path, map_location=device)
+    if "state_dict" in pretrained_dict:
+        pretrained_dict = pretrained_dict["state_dict"]
+    pretrained_dict = {
+        key.removeprefix("module."): value
+        for key, value in pretrained_dict.items()
+    }
+    model.load_state_dict(pretrained_dict, strict=False)
+    return model
 
 
 transform = transforms.Compose([
@@ -107,7 +116,7 @@ def scale_bbox(x1, y1, x2, y2, scale_factor=0.1):
     return x1_new, y1_new, x2_new, y2_new
 
 def gazeto3d_torch(gaze: torch.Tensor) -> torch.Tensor:
-    gaze_gt = torch.zeros(gaze.size(0), 3)
+    gaze_gt = torch.zeros(gaze.size(0), 3, device=gaze.device)
     gaze_gt[:, 0] = -torch.cos(gaze[:, 1]) * torch.sin(gaze[:, 0])  # X component
     gaze_gt[:, 1] = -torch.sin(gaze[:, 1])                           # Y component
     gaze_gt[:, 2] = -torch.cos(gaze[:, 1]) * torch.cos(gaze[:, 0])  # Z component
@@ -255,7 +264,8 @@ def draw_au_panel(au_activations, width=300, height=300, target_width=50):
         cv2.putText(panel, label, (70, start_y + new_height//2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
         # Draw the activation bar
-        bar_width = int(au_activation * (width - 90))  # Scale the bar width according to activation
+        activation = float(au_activation.detach().cpu().item())
+        bar_width = int(activation * (width - 90))  # Scale the bar width according to activation
         cv2.rectangle(panel, (70, start_y + new_height), (70 + bar_width, start_y + new_height + bar_height), (0, 255, 0), -1)
         cv2.rectangle(panel, (70, start_y + new_height), (width - 10, start_y + new_height + bar_height), (0, 0, 0), 1)
         
@@ -267,15 +277,20 @@ def draw_au_panel(au_activations, width=300, height=300, target_width=50):
 
 def process_video(video_path, output_path, retinaface_model, alignment, model, device):
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Could not open video: {video_path}")
     frame_width = int(cap.get(3))  # Original frame width
     frame_height = int(cap.get(4))  # Original frame height
     au_panel_width = 300  # Width of the AU panel
 
     # New combined width is the sum of the original frame width and the AU panel width
-    combined_width = frame_width + au_panel_width * 3
+    combined_width = frame_width + au_panel_width
     combined_height = frame_height  # Height stays the same
 
     # Initialize the VideoWriter with the new dimensions
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*'XVID')  # Use 'XVID' codec for AVI format
     out = cv2.VideoWriter(output_path, fourcc, 20.0, (combined_width, combined_height))
 
@@ -298,6 +313,7 @@ def process_video(video_path, output_path, retinaface_model, alignment, model, d
 
         # Preprocess image and detect faces
         dets = preprocess_image(frame, retinaface_model, device)
+        au_panel = np.ones((frame.shape[0], au_panel_width, 3), dtype=np.uint8) * 255
 
         for det in dets:
             conf = det[4]
@@ -347,40 +363,49 @@ def process_video(video_path, output_path, retinaface_model, alignment, model, d
 
                 au_panel = draw_au_panel(au_output, 300, height=frame.shape[0])
 
-                # Now combine the AU panel with the original frame
-                # Assuming 'frame' is the current video frame
+                break
 
-                frame = np.hstack((frame, au_panel))
-
+        frame = np.hstack((frame, au_panel))
         out.write(frame)
 
     cap.release()
     out.release()
-    cv2.destroyAllWindows()
+    print(f"Saved video visualization: {output_path}")
 
 
 if __name__ == '__main__':
-    video_path = "images/test.avi"
-    output_path = "images/test_out.avi"
+    parser = argparse.ArgumentParser(description="Run OpenFace-3.0 video demo.")
+    parser.add_argument("--video", default="images/test.avi", help="Input video path.")
+    parser.add_argument("--output", default="images/test_out.avi", help="Output video path.")
+    parser.add_argument("--mtl-model", default="./weights/stage2_epoch_7_loss_1.1606_acc_0.5589.pth", help="Multitask model weight path.")
+    parser.add_argument("--retinaface-model", default="./weights/mobilenet0.25_Final.pth", help="RetinaFace model weight path.")
+    parser.add_argument("--landmark-model", default="./weights/WFLW_STARLoss_NME_4_02_FR_2_32_AUC_0_605.pkl", help="STAR landmark model weight path.")
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Inference device.")
+    args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
 
     model = MLT()  
-    model.load_state_dict(torch.load("/work/jiewenh/openFace/MLT/models/mix_au_dev_2/stage2_epoch_6_expr0.5789473684210527_gaze2.392225818079323_au0.5588170370263849_score0.8686903697261595.pth", map_location=device))
+    model.load_state_dict(torch.load(args.mtl_model, map_location=device))
     model = model.to(device)
+    model.eval()
 
     cfg = cfg_mnet 
     retinaface_model = RetinaFace(cfg=cfg, phase='test')
-    retinaface_model = load_model(retinaface_model, './weights/mobilenet0.25_Final.pth', device.type == 'cpu')
+    retinaface_model = load_retinaface_model(retinaface_model, args.retinaface_model, device)
     retinaface_model.eval()
     retinaface_model = retinaface_model.to(device)
 
+    device_id = 0 if device.type == 'cuda' and device.index is None else device.index
     config = {
         "config_name": 'alignment',
-        "device_id": device.index if device.type == 'cuda' else -1,
+        "device_id": device_id if device.type == 'cuda' else -1,
     }
-    args = argparse.Namespace(**config)
-    model_path = './weights/300W_STARLoss_NME_2_87.pkl'
-    alignment = Alignment(args, model_path, dl_framework="pytorch", device_ids=[0])
+    alignment_args = argparse.Namespace(**config)
+    device_ids = [device_id] if device.type == 'cuda' else [-1]
+    alignment = Alignment(alignment_args, args.landmark_model, dl_framework="pytorch", device_ids=device_ids)
 
-    process_video(video_path, output_path, retinaface_model, alignment, model, device)
+    process_video(args.video, args.output, retinaface_model, alignment, model, device)
